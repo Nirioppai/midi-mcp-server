@@ -1,4 +1,4 @@
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
   registerAppTool,
@@ -378,6 +378,220 @@ export function createServer(): McpServer {
             {
               type: 'text' as const,
               text: `Error parsing chord: ${(error as Error).message}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // --- Register Tool: cleanup_midi ---
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (server.registerTool as any)(
+    'cleanup_midi',
+    {
+      description:
+        'Parse an existing MIDI file and output a cleaned version: quantize notes to a rhythmic grid, normalize velocities, and remove duplicate/overlapping notes. Preserves chords, BPM, and track structure. Returns base64-encoded MIDI and a create_midi-compatible JSON payload.',
+      inputSchema: {
+        filePath: z.string().describe('Absolute path to the input MIDI file'),
+        quantize: z
+          .enum(['8', '16'])
+          .optional()
+          .describe('Note grid to quantize to: "16" (16th note, default) or "8" (8th note)'),
+        velocityMin: z
+          .number()
+          .min(0)
+          .max(127)
+          .optional()
+          .describe('Minimum output velocity after normalization (default: 80)'),
+        velocityMax: z
+          .number()
+          .min(0)
+          .max(127)
+          .optional()
+          .describe('Maximum output velocity after normalization (default: 100)'),
+        outputPath: z
+          .string()
+          .optional()
+          .describe(
+            'Absolute path to save the cleaned MIDI file. If omitted, saves next to the source with "_cleaned" suffix.'
+          ),
+      },
+    },
+    async ({
+      filePath,
+      quantize = '16',
+      velocityMin = 80,
+      velocityMax = 100,
+      outputPath,
+    }: {
+      filePath: string;
+      quantize?: '8' | '16';
+      velocityMin?: number;
+      velocityMax?: number;
+      outputPath?: string;
+    }) => {
+      try {
+        // Read and parse source MIDI
+        const buffer = readFileSync(filePath);
+        const sourceMidi = new Midi(new Uint8Array(buffer));
+
+        const bpm = sourceMidi.header.tempos[0]?.bpm ?? 120;
+        const timeSig = sourceMidi.header.timeSignatures[0]?.timeSignature ?? [4, 4];
+        const secondsPerBeat = 60 / bpm;
+        // Grid size in beats: 16th note = 0.25 beats, 8th note = 0.5 beats
+        const gridBeats = quantize === '8' ? 0.5 : 0.25;
+
+        // Build output MIDI with same tempo/time signature
+        const outMidi = new Midi();
+        outMidi.header.tempos = [{ ticks: 0, bpm }];
+        outMidi.header.timeSignatures = [{ ticks: 0, timeSignature: timeSig }];
+        outMidi.header.update();
+
+        interface NoteEntry {
+          midi: number;
+          beat: number;
+          durationBeats: number;
+          velocity: number; // 0.0–1.0
+        }
+
+        const createMidiTracks: MidiTrack[] = [];
+
+        for (const srcTrack of sourceMidi.tracks) {
+          if (srcTrack.notes.length === 0) continue;
+
+          // 1. Convert seconds → beats and quantize to grid
+          let notes: NoteEntry[] = srcTrack.notes.map((n) => ({
+            midi: n.midi,
+            beat: Math.round((n.time / secondsPerBeat) / gridBeats) * gridBeats,
+            durationBeats: Math.max(
+              gridBeats,
+              Math.round((n.duration / secondsPerBeat) / gridBeats) * gridBeats
+            ),
+            velocity: n.velocity, // already 0.0–1.0
+          }));
+
+          // 2. Sort by beat asc, then pitch asc (keeps chords together)
+          notes.sort((a, b) => a.beat - b.beat || a.midi - b.midi);
+
+          // 3. Remove exact duplicates (same pitch + same quantized beat)
+          const seen = new Set<string>();
+          notes = notes.filter((n) => {
+            const key = `${n.midi}:${n.beat}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+
+          // 4. Resolve per-pitch overlaps: truncate earlier note when same pitch restarts
+          const cleaned: NoteEntry[] = [];
+          const pitchLastIdx = new Map<number, number>();
+          for (const n of notes) {
+            const prevIdx = pitchLastIdx.get(n.midi);
+            if (prevIdx !== undefined) {
+              const prev = cleaned[prevIdx];
+              if (prev.beat + prev.durationBeats > n.beat) {
+                cleaned[prevIdx] = {
+                  ...prev,
+                  durationBeats: Math.max(gridBeats, n.beat - prev.beat),
+                };
+              }
+            }
+            pitchLastIdx.set(n.midi, cleaned.length);
+            cleaned.push({ ...n });
+          }
+
+          // 5. Normalize velocities → [velocityMin, velocityMax]
+          const vMin = Math.min(...cleaned.map((n) => n.velocity));
+          const vMax = Math.max(...cleaned.map((n) => n.velocity));
+          const normalizedNotes = cleaned.map((n) => {
+            const scaledV =
+              vMax === vMin
+                ? (velocityMin + velocityMax) / 2
+                : velocityMin + ((n.velocity - vMin) / (vMax - vMin)) * (velocityMax - velocityMin);
+            return { ...n, velocityInt: Math.round(Math.min(velocityMax, Math.max(velocityMin, scaledV))) };
+          });
+
+          // 6. Write to output MIDI track
+          const outTrack = outMidi.addTrack();
+          if (srcTrack.name) outTrack.name = srcTrack.name;
+          outTrack.instrument.number = srcTrack.instrument.number;
+
+          for (const n of normalizedNotes) {
+            outTrack.addNote({
+              midi: n.midi,
+              time: n.beat * secondsPerBeat,
+              duration: n.durationBeats * secondsPerBeat,
+              velocity: n.velocityInt / 127,
+            });
+          }
+
+          // 7. Build create_midi-compatible track (duration as string name where possible)
+          const beatsToStr = (b: number): string | number => {
+            if (b === 4) return '1';
+            if (b === 2) return '2';
+            if (b === 1) return '4';
+            if (b === 0.5) return '8';
+            if (b === 0.25) return '16';
+            if (b === 0.125) return '32';
+            return b; // fallback: numeric beats
+          };
+
+          createMidiTracks.push({
+            name: srcTrack.name || undefined,
+            instrument: srcTrack.instrument.number,
+            notes: normalizedNotes.map((n) => ({
+              pitch: n.midi,
+              startTime: n.beat * secondsPerBeat,
+              duration: beatsToStr(n.durationBeats),
+              velocity: n.velocityInt,
+            })),
+          });
+        }
+
+        // Save cleaned MIDI to file
+        const midiBase64 = Buffer.from(outMidi.toArray()).toString('base64');
+        const resolvedOutputPath =
+          outputPath ?? filePath.replace(/(\.[^./\\]+)$/, '_cleaned$1');
+        writeFileSync(resolvedOutputPath, Buffer.from(midiBase64, 'base64'), 'binary');
+
+        const compositionJson = {
+          bpm,
+          timeSignature: { numerator: timeSig[0], denominator: timeSig[1] },
+          tracks: createMidiTracks,
+        };
+
+        const summary = {
+          message: `Cleaned MIDI saved to "${resolvedOutputPath}"`,
+          sourcePath: filePath,
+          outputPath: resolvedOutputPath,
+          bpm,
+          quantizeGrid: `${quantize}th note`,
+          velocityRange: `${velocityMin}–${velocityMax}`,
+          trackCount: createMidiTracks.length,
+          totalNotes: createMidiTracks.reduce((s, t) => s + t.notes.length, 0),
+        };
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ ...summary, createMidiJson: compositionJson }, null, 2),
+            },
+          ],
+          structuredContent: {
+            midiBase64,
+            ...summary,
+            createMidiJson: compositionJson,
+          },
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Error cleaning MIDI: ${(error as Error).message}`,
             },
           ],
           isError: true,
