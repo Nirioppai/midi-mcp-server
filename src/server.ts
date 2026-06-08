@@ -22,6 +22,10 @@ import {
   parseChordName,
   midiNumberToNoteName,
 } from './chord-utils.js';
+import { registerReadMidi } from './tools/read_midi.js';
+import { registerEditNotes } from './tools/edit_notes.js';
+import { registerWriteMidi } from './tools/write_midi.js';
+import { registerGetMidiStats } from './tools/get_midi_stats.js';
 
 // ---------- Load built HTML at module level ----------
 
@@ -599,6 +603,12 @@ export function createServer(): McpServer {
       }
     }
   );
+
+  // --- Register Primitive MIDI Editing Tools ---
+  registerReadMidi(server);
+  registerEditNotes(server);
+  registerWriteMidi(server);
+  registerGetMidiStats(server);
 
   return server;
 }
