@@ -26,6 +26,7 @@ import { registerReadMidi } from './tools/read_midi.js';
 import { registerEditNotes } from './tools/edit_notes.js';
 import { registerWriteMidi } from './tools/write_midi.js';
 import { registerGetMidiStats } from './tools/get_midi_stats.js';
+import { registerAnalyzeMidi } from './tools/analyze_midi.js';
 
 // ---------- Load built HTML at module level ----------
 
@@ -609,6 +610,7 @@ export function createServer(): McpServer {
   registerEditNotes(server);
   registerWriteMidi(server);
   registerGetMidiStats(server);
+  registerAnalyzeMidi(server);
 
   return server;
 }

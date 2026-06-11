@@ -1,4 +1,4 @@
-import { writeFileSync } from 'fs';
+import { writeFileSync, readFileSync } from 'fs';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Midi } from './midi-loader.js';
@@ -53,12 +53,17 @@ export function registerWriteMidi(server: McpServer): void {
     'write_midi',
     {
       description:
-        'Write MIDI note data to disk as a .mid file. Accepts the same data structure returned by read_midi or edit_notes. By default writes to a new file with "_edited" appended to avoid overwriting the source; pass overwrite: true to write in place.',
+        'Write MIDI note data to disk as a .mid file. Accepts either an inline data object (same schema as read_midi) or a dataPath pointing to a saved JSON file — useful for large files that exceed inline size limits. By default writes to a new file with "_edited" appended; pass overwrite: true to write in place.',
       inputSchema: {
         path: z.string().describe('Absolute path for the output .mid file'),
         data: z
           .any()
-          .describe('MIDI data object in the same schema as read_midi output (MidiFileData)'),
+          .optional()
+          .describe('MIDI data object in the same schema as read_midi output (MidiFileData). Use this or dataPath, not both.'),
+        dataPath: z
+          .string()
+          .optional()
+          .describe('Absolute path to a JSON file containing MidiFileData (alternative to inline data, for large files).'),
         overwrite: z
           .boolean()
           .optional()
@@ -67,14 +72,26 @@ export function registerWriteMidi(server: McpServer): void {
     },
     async ({
       path: filePath,
-      data,
+      data: inlineData,
+      dataPath,
       overwrite = false,
     }: {
       path: string;
-      data: MidiFileData;
+      data?: MidiFileData;
+      dataPath?: string;
       overwrite?: boolean;
     }) => {
       try {
+        if (!inlineData && !dataPath) {
+          return {
+            content: [{ type: 'text' as const, text: 'Error: provide either data or dataPath.' }],
+            isError: true,
+          };
+        }
+        const data: MidiFileData = dataPath
+          ? (JSON.parse(readFileSync(dataPath, 'utf-8')) as MidiFileData)
+          : inlineData!;
+
         const outputPath = resolveOutputPath(filePath, overwrite);
         writeMidiFile(data, outputPath);
 

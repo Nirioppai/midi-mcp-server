@@ -20,8 +20,11 @@ interface SkippedNote {
 
 export function applyEdits(
   data: MidiFileData,
-  edits: NoteEdit[]
-): { edited: number; skipped: number; skippedDetails: SkippedNote[]; preview: MidiNoteData[]; data: MidiFileData } {
+  edits: NoteEdit[],
+  removals: string[] = []
+): { edited: number; removed: number; skipped: number; skippedDetails: SkippedNote[]; preview: MidiNoteData[]; data: MidiFileData } {
+  const removalSet = new Set(removals);
+
   // Build a flat note index: id → {trackIdx, noteIdx}
   const noteIndex = new Map<string, { trackIdx: number; noteIdx: number }>();
   data.tracks.forEach((track, ti) => {
@@ -30,21 +33,35 @@ export function applyEdits(
     });
   });
 
-  // Deep-clone so original is untouched
+  // Deep-clone so original is untouched, then filter removals
   const result: MidiFileData = JSON.parse(JSON.stringify(data));
+  result.tracks = result.tracks.map((track) => ({
+    ...track,
+    notes: track.notes.filter((n) => !removalSet.has(n.id)),
+  }));
+  result.totalNotes = result.tracks.reduce((s, t) => s + t.notes.length, 0);
 
   let edited = 0;
   const skippedDetails: SkippedNote[] = [];
   const preview: MidiNoteData[] = [];
 
   for (const edit of edits) {
+    if (removalSet.has(edit.id)) {
+      skippedDetails.push({ id: edit.id, reason: 'Note was in removals list — skipped edit' });
+      continue;
+    }
     const loc = noteIndex.get(edit.id);
     if (!loc) {
       skippedDetails.push({ id: edit.id, reason: 'Note ID not found' });
       continue;
     }
 
-    const note = result.tracks[loc.trackIdx].notes[loc.noteIdx];
+    // Find the note in the (already-filtered) result tracks
+    const note = result.tracks[loc.trackIdx]?.notes.find((n) => n.id === edit.id);
+    if (!note) {
+      skippedDetails.push({ id: edit.id, reason: 'Note not found after removal filter' });
+      continue;
+    }
 
     // Apply only explicitly provided fields — never infer or default anything.
     if (edit.pitch !== undefined) {
@@ -62,6 +79,7 @@ export function applyEdits(
 
   return {
     edited,
+    removed: removalSet.size,
     skipped: skippedDetails.length,
     skippedDetails,
     preview,
@@ -113,12 +131,18 @@ export function registerEditNotes(server: McpServer): void {
             })
           )
           .describe('List of note edits to apply'),
+        removals: z
+          .array(z.string())
+          .optional()
+          .describe(
+            'List of note IDs to remove entirely (e.g. duplicates from analyze_midi). Removals are applied before edits.'
+          ),
       },
     },
-    async ({ path: filePath, edits }: { path: string; edits: NoteEdit[] }) => {
+    async ({ path: filePath, edits, removals = [] }: { path: string; edits: NoteEdit[]; removals?: string[] }) => {
       try {
         const source = parseMidiFile(filePath);
-        const result = applyEdits(source, edits);
+        const result = applyEdits(source, edits, removals);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
         };
