@@ -2,7 +2,7 @@
   "mcpServers": {
     "midi": {
       "command": "node",
-      "args": ["c:/Active Codebase/piano-mcp/build/index.js"]
+      "args": ["G:/Active Codebase/piano-mcp/build/index.js"]
     }
   }
 }
